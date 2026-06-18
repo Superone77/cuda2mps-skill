@@ -1,0 +1,4 @@
+interface:
+  display_name: "CUDA2MPS"
+  short_description: "Port CUDA PyTorch code to Apple MPS"
+  default_prompt: "Use $cuda2mps to port this CUDA PyTorch or Transformers script to run on Mac MPS."
