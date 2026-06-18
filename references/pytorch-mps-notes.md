@@ -71,6 +71,44 @@ Rules of thumb:
 - Prefer allocating intermediate tensors from existing tensors: `x.new_zeros(...)`, `torch.zeros(..., device=x.device, dtype=x.dtype)`.
 - For assignment into preallocated tensors, cast source to destination dtype at the boundary, not deep inside model math.
 
+## Submodule Boundary Contracts
+
+Some ports need different dtype policies for different submodules. A common stable pattern is a bf16 or fp16 transformer body with an fp32 decoder, image head, VAE, or convolution-heavy postprocessor. Keep the submodule on MPS, but make its entry point an explicit device/dtype/autocast boundary.
+
+Do not only cast dtype:
+
+```python
+x = x.to(dtype=next(module.parameters()).dtype)
+```
+
+This can still fail if upstream code produced a CPU tensor. Instead, align both device and dtype to the target module:
+
+```python
+class ModuleBoundary(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    @property
+    def target_param(self):
+        return next(self.module.parameters())
+
+    def _disabled_autocast(self):
+        device_type = self.target_param.device.type
+        if device_type in {"cuda", "mps"}:
+            return torch.autocast(device_type=device_type, enabled=False)
+        return torch.autocast(device_type="cpu", enabled=False)
+
+    def forward(self, x):
+        target = self.target_param
+        with self._disabled_autocast():
+            return self.module(x.to(device=target.device, dtype=target.dtype))
+```
+
+For modules that expose methods such as `encode`, `decode`, or `generate`, apply the same boundary to each entry method. Choose the autocast-disabled context from the target module's device, not from the input tensor's current device. This matters when the input tensor has unexpectedly fallen back to CPU but the intended module still lives on MPS.
+
+Use this pattern before moving a failing submodule to CPU. It preserves the user's "keep work on MPS" requirement while isolating fragile fp32 blocks from surrounding bf16/fp16 autocast.
+
 ## CUDA-only Libraries
 
 These usually need replacement or bypass on MPS:
@@ -118,12 +156,26 @@ Use them carefully:
 4. Wrap only suspect blocks with autocast changes; avoid global dtype flips.
 5. Replace CUDA-only kernels with PyTorch equivalents.
 6. Enable CPU fallback only to identify unsupported ops, then remove it if native MPS is required.
-7. Compare a small CPU run when correctness is suspect; compare shapes, dtypes, and a short output, not full performance.
+7. Exercise every major execution mode, especially paths that add decoding, encoding, generation, editing, or postprocessing after a simpler text/understanding pass.
+8. Compare a small CPU run when correctness is suspect; compare shapes, dtypes, and a short output, not full performance.
+
+## Memory Monitoring
+
+MPS memory growth is often easier to see with both PyTorch allocator counters and process/system monitoring:
+
+```python
+if torch.backends.mps.is_available():
+    print("mps_current_gib", torch.mps.current_allocated_memory() / 1024**3)
+    print("mps_driver_gib", torch.mps.driver_allocated_memory() / 1024**3)
+```
+
+On macOS, pair this with `ps` or Activity Monitor because unified memory can show up as process RSS, wired memory, and MPS driver allocation in different ways. Be careful with `resource.getrusage(...).ru_maxrss`: its units differ across operating systems, so convert Darwin and Linux separately before reporting GiB.
 
 ## Common Error Hints
 
 - `Torch not compiled with CUDA enabled`: remove CUDA-only imports or device calls.
 - `NotImplementedError ... not currently implemented for MPS`: try native alternative; use `PYTORCH_ENABLE_MPS_FALLBACK=1` only as a diagnostic/last resort.
 - `Input type (...) and bias type (...) should be the same`: an autocast or manual cast boundary is inconsistent; align module input to weight dtype or disable autocast for that module on MPS.
+- `input(device='cpu') and weight(device=mps:0) must be on the same device`: a boundary tensor fell back or was materialized on CPU. Cast the tensor to the target module's MPS device and dtype at the entry boundary.
 - `Destination NDArray and Accumulator NDArray cannot have different datatype`: MPS matmul received mixed accumulator/output dtypes; choose one dtype for the block or remove nested autocast conflict.
 - `Index put requires source and destination dtypes match`: cast the source tensor to destination dtype at the assignment boundary.
