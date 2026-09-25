@@ -9,7 +9,7 @@ This skill captures practical guidance for porting CUDA-oriented PyTorch, Transf
 The working copy currently lives at:
 
 ```text
-/Users/vinci/.codex/skills/cuda2mps
+/Users/xxx/.codex/skills/cuda2mps
 ```
 
 ## Contents
